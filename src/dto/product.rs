@@ -26,7 +26,7 @@ pub struct ProductListQuery {
     pub keyword: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ProductResponse {
     pub id: i64,
     pub name: String,
@@ -37,7 +37,7 @@ pub struct ProductResponse {
     pub updated_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ProductListResponse {
     pub list: Vec<ProductResponse>,
     pub total: i64,

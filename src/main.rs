@@ -78,9 +78,9 @@ async fn main() -> std::io::Result<()> {
     let pool = db::init_pool().await;
 
     let cache = match cache::init_redis().await {
-        Ok(conn) => {
-            log::info!("Redis connection established");
-            ProductCache::new(Some(conn))
+        Ok(conns) => {
+            log::info!("Redis connection pool established ({} connections)", conns.len());
+            ProductCache::new(Some(conns))
         }
         Err(e) => {
             log::warn!("Redis not available, caching disabled: {e}");
@@ -97,7 +97,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(cache_data.clone())
             .wrap(TraceMiddleware)
             .wrap(ErrorHandler)
-            .wrap(Logger::new("%t | %r | %s | %b bytes | %Dµs"))
+            .wrap(Logger::new("%t | %r | %s | %b bytes | %Dms"))
             .service(hello)
             .service(echo)
             .service(db_status)

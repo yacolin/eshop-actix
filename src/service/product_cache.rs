@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -13,11 +13,24 @@ use crate::dto::product::{CachedProductItem, ProductListResponse, ProductRespons
 use crate::error::{BizError, ERR_INTERNAL_SERVER, ERR_PRODUCT_NOT_FOUND};
 use crate::repository;
 
+// ====== Cached Response Types (pre-serialized bytes) ======
+
+pub enum CachedItemResult {
+    Serialized(Vec<u8>),
+    Fresh(ProductResponse),
+}
+
+pub enum CachedListResult {
+    Serialized(Vec<u8>),
+    Fresh(ProductListResponse),
+}
+
 // ====== Constants ======
 
 const PRODUCT_CACHE_ZSET: &str = "product:zset";
 const PRODUCT_INFO_PREFIX: &str = "product:info:";
 const LOCAL_CACHE_TTL: Duration = Duration::from_secs(60);
+const LOCAL_LIST_CACHE_TTL: Duration = Duration::from_secs(30);
 const HOT_KEY_THRESHOLD: u64 = 1000;
 const HOT_KEY_WINDOW: Duration = Duration::from_secs(10);
 const EMPTY_PLACEHOLDER: &str = "__EMPTY__";
@@ -138,18 +151,20 @@ impl HotKeyCounter {
 // ====== Local Cache ======
 
 struct LocalCache {
-    singles: DashMap<i64, (Instant, CachedProductItem)>,
+    single_bytes: DashMap<i64, (Instant, Vec<u8>)>,
+    list_bytes: DashMap<(u32, u32), (Instant, Vec<u8>)>,
 }
 
 impl LocalCache {
     fn new() -> Self {
         LocalCache {
-            singles: DashMap::new(),
+            single_bytes: DashMap::new(),
+            list_bytes: DashMap::new(),
         }
     }
 
-    fn get_single(&self, id: i64) -> Option<CachedProductItem> {
-        if let Some(entry) = self.singles.get(&id) {
+    fn get_single_bytes(&self, id: i64) -> Option<Vec<u8>> {
+        if let Some(entry) = self.single_bytes.get(&id) {
             if entry.0.elapsed() < LOCAL_CACHE_TTL {
                 return Some(entry.1.clone());
             }
@@ -157,17 +172,37 @@ impl LocalCache {
         None
     }
 
-    fn set_single(&self, id: i64, item: CachedProductItem) {
-        self.singles.insert(id, (Instant::now(), item));
+    fn set_single_bytes(&self, id: i64, bytes: Vec<u8>) {
+        self.single_bytes.insert(id, (Instant::now(), bytes));
     }
 
     fn remove_single(&self, id: i64) {
-        self.singles.remove(&id);
+        self.single_bytes.remove(&id);
     }
 
-    fn warmup(&self, items: Vec<CachedProductItem>) {
+    fn get_list_bytes(&self, page: u32, page_size: u32) -> Option<Vec<u8>> {
+        if let Some(entry) = self.list_bytes.get(&(page, page_size)) {
+            if entry.0.elapsed() < LOCAL_LIST_CACHE_TTL {
+                return Some(entry.1.clone());
+            }
+        }
+        None
+    }
+
+    fn set_list_bytes(&self, page: u32, page_size: u32, bytes: Vec<u8>) {
+        self.list_bytes
+            .insert((page, page_size), (Instant::now(), bytes));
+    }
+
+    fn clear_lists(&self) {
+        self.list_bytes.clear();
+    }
+
+    fn warmup_singles(&self, items: Vec<CachedProductItem>) {
         for item in items {
-            self.set_single(item.id, item);
+            if let Ok(bytes) = serde_json::to_vec(&item) {
+                self.set_single_bytes(item.id, bytes);
+            }
         }
     }
 }
@@ -175,23 +210,33 @@ impl LocalCache {
 // ====== Inner Cache (active when Redis is available) ======
 
 struct InnerCache {
-    redis: Arc<tokio::sync::Mutex<ConnectionManager>>,
+    redis_conns: Vec<tokio::sync::Mutex<ConnectionManager>>,
+    next_conn: AtomicUsize,
     bloom: BloomFilter,
     local: LocalCache,
     hot_counter: HotKeyCounter,
 }
 
 impl InnerCache {
-    async fn get_by_id(&self, pool: &MySqlPool, id: i64) -> Result<ProductResponse, BizError> {
+    fn get_conn(&self) -> &tokio::sync::Mutex<ConnectionManager> {
+        let idx = self
+            .next_conn
+            .fetch_add(1, Ordering::Relaxed)
+            % self.redis_conns.len();
+        &self.redis_conns[idx]
+    }
+
+    async fn get_by_id(&self, pool: &MySqlPool, id: i64) -> Result<CachedItemResult, BizError> {
         let redis_key = format!("{}{}", PRODUCT_INFO_PREFIX, id);
 
         if self.bloom.may_exist(id) {
-            if let Some(cached) = self.local.get_single(id) {
+            if let Some(bytes) = self.local.get_single_bytes(id) {
                 self.hot_counter.increment(id);
-                return Ok(ProductResponse::from(&cached));
+                return Ok(CachedItemResult::Serialized(bytes));
             }
         }
-        let mut conn = self.redis.lock().await;
+
+        let mut conn = self.get_conn().lock().await;
 
         let result: redis::RedisResult<Option<String>> = redis::cmd("GET")
             .arg(&redis_key)
@@ -201,8 +246,10 @@ impl InnerCache {
         match result {
             Ok(Some(data)) if data != EMPTY_PLACEHOLDER => {
                 if let Ok(item) = serde_json::from_str::<CachedProductItem>(&data) {
-                    self.local.set_single(id, item.clone());
-                    return Ok(ProductResponse::from(&item));
+                    if let Ok(bytes) = serde_json::to_vec(&item) {
+                        self.local.set_single_bytes(id, bytes.clone());
+                        return Ok(CachedItemResult::Serialized(bytes));
+                    }
                 }
             }
             Ok(Some(_)) => {
@@ -221,7 +268,9 @@ impl InnerCache {
         match product {
             Some(p) => {
                 let cached = CachedProductItem::from(&p);
-                self.local.set_single(id, cached.clone());
+                if let Ok(bytes) = serde_json::to_vec(&cached) {
+                    self.local.set_single_bytes(id, bytes);
+                }
 
                 if let Ok(json) = serde_json::to_string(&cached) {
                     let _: redis::RedisResult<()> = redis::cmd("SET")
@@ -231,7 +280,7 @@ impl InnerCache {
                         .await;
                 }
 
-                Ok(ProductResponse::from(p))
+                Ok(CachedItemResult::Fresh(ProductResponse::from(p)))
             }
             None => {
                 let _: redis::RedisResult<()> = redis::cmd("SETEX")
@@ -251,14 +300,20 @@ impl InnerCache {
         keyword: Option<&str>,
         page: u32,
         page_size: u32,
-    ) -> Result<ProductListResponse, BizError> {
+    ) -> Result<CachedListResult, BizError> {
         if keyword.is_some() {
-            return Self::list_from_db(pool, keyword, page, page_size).await;
+            let resp = Self::list_from_db(pool, keyword, page, page_size).await?;
+            return Ok(CachedListResult::Fresh(resp));
+        }
+
+        if let Some(bytes) = self.local.get_list_bytes(page, page_size) {
+            return Ok(CachedListResult::Serialized(bytes));
         }
 
         let offset = (page.saturating_sub(1)) as i64;
         let stop = offset + page_size as i64 - 1;
-        let mut conn = self.redis.lock().await;
+
+        let mut conn = self.get_conn().lock().await;
 
         let result: redis::RedisResult<redis::Value> = ZRANGE_MGET_SCRIPT
             .key(PRODUCT_CACHE_ZSET)
@@ -279,10 +334,14 @@ impl InnerCache {
                             .map(|cached| ProductResponse::from(&cached))
                             .collect();
                         if !products.is_empty() {
-                            return Ok(ProductListResponse {
+                            let resp = ProductListResponse {
                                 list: products,
                                 total,
-                            });
+                            };
+                            if let Ok(bytes) = serde_json::to_vec(&resp) {
+                                self.local.set_list_bytes(page, page_size, bytes.clone());
+                                return Ok(CachedListResult::Serialized(bytes));
+                            }
                         }
                     }
                 }
@@ -292,7 +351,8 @@ impl InnerCache {
             }
         }
 
-        Self::list_from_db(pool, None, page, page_size).await
+        let resp = Self::list_from_db(pool, None, page, page_size).await?;
+        Ok(CachedListResult::Fresh(resp))
     }
 
     async fn list_from_db(
@@ -363,7 +423,7 @@ impl InnerCache {
                 ERR_INTERNAL_SERVER
             })?;
 
-        let mut conn = self.redis.lock().await;
+        let mut conn = self.get_conn().lock().await;
 
         let _: redis::RedisResult<()> = redis::cmd("DEL")
             .arg(PRODUCT_CACHE_ZSET)
@@ -391,19 +451,59 @@ impl InnerCache {
             }
         }
 
+        drop(conn);
+
         self.bloom.clear();
         self.bloom.add_all(&ids);
-        self.local.warmup(items);
+        self.local.warmup_singles(items);
+
+        // pre-warm local list cache with first 3 pages
+        let page_sizes = [10u32, 20u32, 50u32];
+        for page_size in page_sizes {
+            let total = ids.len() as i64;
+            let mut page = 1u32;
+            loop {
+                let offset = ((page.saturating_sub(1)) as i64).min(ids.len() as i64 - 1);
+                let stop = (offset + page_size as i64 - 1).min(ids.len() as i64 - 1);
+                if offset > stop {
+                    break;
+                }
+                let page_ids: Vec<i64> = ids.iter()
+                    .rev()
+                    .skip(offset as usize)
+                    .take((stop - offset + 1) as usize)
+                    .copied()
+                    .collect();
+                let list: Vec<ProductResponse> = page_ids.iter()
+                    .filter_map(|id| self.local.get_single_bytes(*id))
+                    .filter_map(|bytes| serde_json::from_slice::<CachedProductItem>(&bytes).ok())
+                    .map(|cached| ProductResponse::from(&cached))
+                    .collect();
+                if list.is_empty() {
+                    break;
+                }
+                let resp = ProductListResponse { list, total };
+                if let Ok(bytes) = serde_json::to_vec(&resp) {
+                    self.local.set_list_bytes(page, page_size, bytes);
+                }
+                page += 1;
+                if offset as usize + page_size as usize >= ids.len() {
+                    break;
+                }
+            }
+        }
 
         Ok(ids.len() as i32)
     }
 
     async fn evict_product(&self, id: i64) {
         self.local.remove_single(id);
+        self.local.clear_lists();
 
-        let mut conn = self.redis.lock().await;
+        let mut conn = self.get_conn().lock().await;
         let key = format!("{}{}", PRODUCT_INFO_PREFIX, id);
-        let _: redis::RedisResult<()> = redis::cmd("DEL").arg(&key).query_async(&mut *conn).await;
+        let _: redis::RedisResult<()> =
+            redis::cmd("DEL").arg(&key).query_async(&mut *conn).await;
         let _: redis::RedisResult<()> = redis::cmd("ZREM")
             .arg(PRODUCT_CACHE_ZSET)
             .arg(id)
@@ -423,10 +523,11 @@ pub struct ProductCache {
 }
 
 impl ProductCache {
-    pub fn new(redis: Option<ConnectionManager>) -> Self {
+    pub fn new(conns: Option<Vec<ConnectionManager>>) -> Self {
         ProductCache {
-            inner: redis.map(|conn| InnerCache {
-                redis: Arc::new(tokio::sync::Mutex::new(conn)),
+            inner: conns.map(|managers| InnerCache {
+                redis_conns: managers.into_iter().map(tokio::sync::Mutex::new).collect(),
+                next_conn: AtomicUsize::new(0),
                 bloom: BloomFilter::new(BLOOM_SIZE, BLOOM_HASHES),
                 local: LocalCache::new(),
                 hot_counter: HotKeyCounter::new(),
@@ -434,7 +535,7 @@ impl ProductCache {
         }
     }
 
-    pub async fn get_by_id(&self, pool: &MySqlPool, id: i64) -> Result<ProductResponse, BizError> {
+    pub async fn get_by_id(&self, pool: &MySqlPool, id: i64) -> Result<CachedItemResult, BizError> {
         match &self.inner {
             Some(cache) => cache.get_by_id(pool, id).await,
             None => {
@@ -446,6 +547,7 @@ impl ProductCache {
                     })?;
                 product
                     .map(ProductResponse::from)
+                    .map(CachedItemResult::Fresh)
                     .ok_or(ERR_PRODUCT_NOT_FOUND)
             }
         }
@@ -457,7 +559,7 @@ impl ProductCache {
         keyword: Option<&str>,
         page: u32,
         page_size: u32,
-    ) -> Result<ProductListResponse, BizError> {
+    ) -> Result<CachedListResult, BizError> {
         match &self.inner {
             Some(cache) => cache.list(pool, keyword, page, page_size).await,
             None => {
@@ -474,10 +576,10 @@ impl ProductCache {
                         log::error!("[product_cache] find_list error: {e}");
                         ERR_INTERNAL_SERVER
                     })?;
-                Ok(ProductListResponse {
+                Ok(CachedListResult::Fresh(ProductListResponse {
                     list: products.into_iter().map(ProductResponse::from).collect(),
                     total,
-                })
+                }))
             }
         }
     }
@@ -503,18 +605,21 @@ impl ProductCache {
         if let Some(cache) = &self.inner {
             cache.evict_product(id).await;
 
-            let redis = cache.redis.clone();
+            let redis_url = std::env::var("REDIS_URL").unwrap_or_default();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                let mut conn = redis.lock().await;
-                let key = format!("{}{}", PRODUCT_INFO_PREFIX, id);
-                let _: redis::RedisResult<()> =
-                    redis::cmd("DEL").arg(&key).query_async(&mut *conn).await;
-                let _: redis::RedisResult<()> = redis::cmd("ZREM")
-                    .arg(PRODUCT_CACHE_ZSET)
-                    .arg(id)
-                    .query_async(&mut *conn)
-                    .await;
+                if let Ok(client) = redis::Client::open(redis_url.as_str()) {
+                    if let Ok(mut conn) = ConnectionManager::new(client).await {
+                        let key = format!("{}{}", PRODUCT_INFO_PREFIX, id);
+                        let _: redis::RedisResult<()> =
+                            redis::cmd("DEL").arg(&key).query_async(&mut conn).await;
+                        let _: redis::RedisResult<()> = redis::cmd("ZREM")
+                            .arg(PRODUCT_CACHE_ZSET)
+                            .arg(id)
+                            .query_async(&mut conn)
+                            .await;
+                    }
+                }
             });
         }
     }

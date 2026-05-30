@@ -5,7 +5,7 @@ use crate::dto::product::{
 };
 use crate::error::{BizError, ERR_DUPLICATE_SKU, ERR_INTERNAL_SERVER, ERR_PRODUCT_NOT_FOUND};
 use crate::repository;
-use crate::service::product_cache::ProductCache;
+use crate::service::product_cache::{CachedItemResult, CachedListResult, ProductCache};
 
 pub async fn get_product(pool: &MySqlPool, id: i64) -> Result<ProductResponse, BizError> {
     let product = repository::product::find_by_id(pool, id)
@@ -24,7 +24,7 @@ pub async fn get_product_cached(
     pool: &MySqlPool,
     cache: &ProductCache,
     id: i64,
-) -> Result<ProductResponse, BizError> {
+) -> Result<CachedItemResult, BizError> {
     cache.get_by_id(pool, id).await
 }
 
@@ -160,7 +160,7 @@ pub async fn list_products_cached(
     keyword: Option<&str>,
     page: u32,
     page_size: u32,
-) -> Result<ProductListResponse, BizError> {
+) -> Result<CachedListResult, BizError> {
     cache.list(pool, keyword, page, page_size).await
 }
 

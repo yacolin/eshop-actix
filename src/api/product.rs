@@ -6,7 +6,7 @@ use crate::dto::product::{CreateProductRequest, ProductListQuery, UpdateProductR
 use crate::error::ERR_INTERNAL_SERVER;
 use crate::middleware::trace::get_trace_id;
 use crate::service;
-use crate::service::product_cache::ProductCache;
+use crate::service::product_cache::{CachedItemResult, CachedListResult, ProductCache};
 
 pub async fn create(
     req: HttpRequest,
@@ -77,7 +77,11 @@ pub async fn get_by_id_cached(
     let id = path.into_inner();
 
     match service::product::get_product_cached(pool.get_ref(), cache.get_ref(), id).await {
-        Ok(product) => match trace_id {
+        Ok(CachedItemResult::Serialized(data_bytes)) => match trace_id {
+            Some(tid) => response::success_from_bytes_with_trace(data_bytes, tid),
+            None => response::success_from_bytes(data_bytes),
+        },
+        Ok(CachedItemResult::Fresh(product)) => match trace_id {
             Some(tid) => response::success_with_trace(product, tid),
             None => response::success(product),
         },
@@ -210,7 +214,11 @@ pub async fn list_cached(
     )
     .await
     {
-        Ok(products) => match trace_id {
+        Ok(CachedListResult::Serialized(data_bytes)) => match trace_id {
+            Some(tid) => response::success_from_bytes_with_trace(data_bytes, tid),
+            None => response::success_from_bytes(data_bytes),
+        },
+        Ok(CachedListResult::Fresh(products)) => match trace_id {
             Some(tid) => response::success_with_trace(products, tid),
             None => response::success(products),
         },
