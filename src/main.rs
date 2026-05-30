@@ -14,6 +14,7 @@ mod service;
 
 use api::response;
 use middleware::error_handler::{ErrorHandler, set_global_panic_hook};
+use middleware::logger::ConditionalLogger;
 use middleware::trace::{ConditionalTrace, get_trace_id};
 use service::product_cache::ProductCache;
 
@@ -101,6 +102,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(pool.clone()))
             .app_data(cache_data.clone())
             .wrap(ConditionalTrace)
+            .wrap(ConditionalLogger)
             .wrap(ErrorHandler)
             .service(hello)
             .service(echo)
