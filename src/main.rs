@@ -1,30 +1,92 @@
 use actix_web::middleware::Logger;
-use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
+use actix_web::{App, HttpServer, Responder, get, post, web};
+use serde::Serialize;
+
+mod api;
+mod db;
+mod error;
+mod middleware;
+
+use api::response;
+use middleware::error_handler::{set_global_panic_hook, ErrorHandler};
+use middleware::trace::{get_trace_id, TraceMiddleware};
 
 #[get("/")]
 async fn hello() -> impl Responder {
-    HttpResponse::Ok().body("Hello world!")
+    response::success("Hello world!")
 }
 
 #[post("/echo")]
 async fn echo(req_body: String) -> impl Responder {
-    HttpResponse::Ok().body(req_body)
+    response::success(req_body)
 }
 
 async fn manual_hello() -> impl Responder {
-    HttpResponse::Ok().body("Hey there!")
+    response::success("Hey there!")
+}
+
+#[derive(Serialize)]
+struct DbStatusData {
+    status: String,
+}
+
+#[get("/db_status")]
+async fn db_status(pool: web::Data<sqlx::MySqlPool>) -> impl Responder {
+    match sqlx::query("SELECT 1").execute(pool.get_ref()).await {
+        Ok(_) => response::success(DbStatusData {
+            status: "connected".to_string(),
+        }),
+        Err(_e) => response::biz_error(&error::ERR_PAYMENT_FAILED),
+    }
+}
+
+#[get("/products/{id}")]
+async fn get_product(path: web::Path<i32>) -> impl Responder {
+    let _id = path.into_inner();
+
+    response::biz_error(&error::ERR_PRODUCT_NOT_FOUND)
+}
+
+#[get("/unauthorized")]
+async fn unauthorized() -> impl Responder {
+    response::biz_error(&error::ERR_UNAUTHORIZED)
+}
+
+#[get("/trace")]
+async fn trace_demo(req: actix_web::HttpRequest) -> impl Responder {
+    let trace_id = get_trace_id(&req).unwrap_or_default();
+    response::success_with_trace("this request has a trace id", trace_id)
+}
+
+async fn not_found() -> impl Responder {
+    response::biz_error(&error::ERR_NOT_FOUND)
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    set_global_panic_hook();
+
+    dotenvy::dotenv().ok();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    HttpServer::new(|| {
+    let pool = db::init_pool().await;
+
+    log::info!("Starting server at http://127.0.0.1:8080");
+
+    HttpServer::new(move || {
         App::new()
+            .app_data(web::Data::new(pool.clone()))
+            .wrap(TraceMiddleware)
+            .wrap(ErrorHandler)
             .wrap(Logger::new("%t | %r | %s | %b bytes | %Dµs"))
             .service(hello)
             .service(echo)
+            .service(db_status)
+            .service(get_product)
+            .service(unauthorized)
+            .service(trace_demo)
             .route("/hey", web::get().to(manual_hello))
+            .default_service(web::to(not_found))
     })
     .bind(("127.0.0.1", 8080))?
     .run()
