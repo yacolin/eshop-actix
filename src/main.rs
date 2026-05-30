@@ -122,6 +122,15 @@ async fn main() -> std::io::Result<()> {
                     .route("/{id}", web::put().to(api::product::update))
                     .route("/{id}", web::delete().to(api::product::delete)),
             )
+            .service(
+                web::scope("/api/v1/inventory")
+                    .route("", web::post().to(api::inventory::create))
+                    .route("", web::get().to(api::inventory::list))
+                    .route("/product/{product_id}", web::get().to(api::inventory::get_by_product_id))
+                    .route("/{id}", web::get().to(api::inventory::get_by_id))
+                    .route("/{id}", web::put().to(api::inventory::update))
+                    .route("/{id}", web::delete().to(api::inventory::delete)),
+            )
             .default_service(web::to(not_found))
     })
     .workers(num_workers)

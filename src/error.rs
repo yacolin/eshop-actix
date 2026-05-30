@@ -51,6 +51,10 @@ pub const ERR_NOT_FOUND: BizError = BizError::new(1010, "resource not found");
 // pub const ERR_PARSE_TOKEN: BizError = BizError::new(1022, "parse token failed");
 pub const ERR_DUPLICATE_SKU: BizError = BizError::new(1023, "duplicate sku");
 
+// Inventory error codes (1200-1299)
+pub const ERR_INVENTORY_NOT_FOUND: BizError = BizError::new(1200, "inventory not found");
+pub const ERR_DUPLICATE_INVENTORY: BizError = BizError::new(1201, "inventory already exists for this product");
+
 // ==================== Domain: Permission (2001-2999) ====================
 // pub const ERR_PERMISSION_NOT_FOUND: BizError = BizError::new(2001, "permission not found");
 // pub const ERR_INSUFFICIENT_PERMISSIONS: BizError =
