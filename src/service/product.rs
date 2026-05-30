@@ -3,7 +3,7 @@ use sqlx::MySqlPool;
 use crate::dto::product::{
     CreateProductRequest, ProductListResponse, ProductResponse, UpdateProductRequest,
 };
-use crate::error::{BizError, ERR_DUPLICATE_SKU, ERR_PRODUCT_NOT_FOUND};
+use crate::error::{BizError, ERR_DUPLICATE_SKU, ERR_INTERNAL_SERVER, ERR_PRODUCT_NOT_FOUND};
 use crate::repository;
 
 pub async fn get_product(pool: &MySqlPool, id: i64) -> Result<ProductResponse, BizError> {
@@ -11,7 +11,7 @@ pub async fn get_product(pool: &MySqlPool, id: i64) -> Result<ProductResponse, B
         .await
         .map_err(|e| {
             log::error!("[product_service] find_by_id error: {e}");
-            BizError::new(500, "internal server error")
+            ERR_INTERNAL_SERVER
         })?;
 
     product
@@ -27,7 +27,7 @@ pub async fn create_product(
         .await
         .map_err(|e| {
             log::error!("[product_service] find_by_sku error: {e}");
-            BizError::new(500, "internal server error")
+            ERR_INTERNAL_SERVER
         })?;
 
     if existing.is_some() {
@@ -44,7 +44,7 @@ pub async fn create_product(
     .await
     .map_err(|e| {
         log::error!("[product_service] create error: {e}");
-        BizError::new(500, "internal server error")
+        ERR_INTERNAL_SERVER
     })?;
 
     Ok(ProductResponse::from(product))
@@ -60,7 +60,7 @@ pub async fn update_product(
             .await
             .map_err(|e| {
                 log::error!("[product_service] find_by_sku error: {e}");
-                BizError::new(500, "internal server error")
+                ERR_INTERNAL_SERVER
             })?;
 
         if let Some(p) = existing {
@@ -81,7 +81,7 @@ pub async fn update_product(
     .await
     .map_err(|e| {
         log::error!("[product_service] update error: {e}");
-        BizError::new(500, "internal server error")
+        ERR_INTERNAL_SERVER
     })?;
 
     product
@@ -94,7 +94,7 @@ pub async fn delete_product(pool: &MySqlPool, id: i64) -> Result<(), BizError> {
         .await
         .map_err(|e| {
             log::error!("[product_service] soft_delete error: {e}");
-            BizError::new(500, "internal server error")
+            ERR_INTERNAL_SERVER
         })?;
 
     if deleted {
@@ -116,18 +116,18 @@ pub async fn list_products(
         .await
         .map_err(|e| {
             log::error!("[product_service] count_list error: {e}");
-            BizError::new(500, "internal server error")
+            ERR_INTERNAL_SERVER
         })?;
 
     let products = repository::product::find_list(pool, keyword, offset, page_size)
         .await
         .map_err(|e| {
             log::error!("[product_service] find_list error: {e}");
-            BizError::new(500, "internal server error")
+            ERR_INTERNAL_SERVER
         })?;
 
     Ok(ProductListResponse {
-        items: products.into_iter().map(ProductResponse::from).collect(),
+        list: products.into_iter().map(ProductResponse::from).collect(),
         total,
     })
 }

@@ -34,15 +34,9 @@ pub fn success_with_trace<T: Serialize>(data: T, trace_id: String) -> HttpRespon
 
 pub fn biz_error(err: &BizError) -> HttpResponse {
     let status = crate::middleware::error_handler::map_biz_error_to_status(err);
-    HttpResponse::build(status).json(ApiResponse::<()> {
-        code: err.code,
-        message: err.message.to_string(),
-        data: None,
-        trace_id: None,
-    })
+    biz_error_with_status(err, status)
 }
 
-#[allow(dead_code)]
 pub fn biz_error_with_status(err: &BizError, status: StatusCode) -> HttpResponse {
     HttpResponse::build(status).json(ApiResponse::<()> {
         code: err.code,
@@ -52,7 +46,6 @@ pub fn biz_error_with_status(err: &BizError, status: StatusCode) -> HttpResponse
     })
 }
 
-#[allow(dead_code)]
 pub fn biz_error_with_trace(err: &BizError, trace_id: String) -> HttpResponse {
     let status = crate::middleware::error_handler::map_biz_error_to_status(err);
     HttpResponse::build(status).json(ApiResponse::<()> {
@@ -71,7 +64,7 @@ pub fn invalid_args(message: &str) -> HttpResponse {
         trace_id: None,
     })
 }
-#[allow(dead_code)]
+
 pub fn sys_error(err: impl std::fmt::Display) -> HttpResponse {
     log::error!("Internal server error: {err}");
     HttpResponse::InternalServerError().json(ApiResponse::<()> {

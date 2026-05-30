@@ -90,6 +90,7 @@ where
 
 pub fn map_biz_error_to_status(err: &BizError) -> StatusCode {
     match err.code {
+        500 => StatusCode::INTERNAL_SERVER_ERROR,
         1004 => StatusCode::UNAUTHORIZED,
         2002 => StatusCode::FORBIDDEN,
         1008 => StatusCode::BAD_GATEWAY,

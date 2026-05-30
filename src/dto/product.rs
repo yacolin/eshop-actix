@@ -37,7 +37,7 @@ pub struct ProductResponse {
 
 #[derive(Debug, Serialize)]
 pub struct ProductListResponse {
-    pub items: Vec<ProductResponse>,
+    pub list: Vec<ProductResponse>,
     pub total: i64,
 }
 

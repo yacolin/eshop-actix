@@ -20,6 +20,7 @@ impl fmt::Display for BizError {
 }
 
 // ==================== Domain: General (1001-1999) ====================
+pub const ERR_INTERNAL_SERVER: BizError = BizError::new(500, "internal server error");
 pub const ERR_PRODUCT_NOT_FOUND: BizError = BizError::new(1001, "product not found");
 // pub const ERR_INVALID_PARAMS: BizError = BizError::new(1002, "invalid parameters");
 // pub const ERR_PAGINATION_QUERY: BizError = BizError::new(1003, "invalid pagination query");
