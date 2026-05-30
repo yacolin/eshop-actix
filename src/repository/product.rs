@@ -19,16 +19,19 @@ pub async fn create(
     price: i64,
     sku: &str,
 ) -> Result<Product, sqlx::Error> {
-    sqlx::query_as::<_, Product>(
-        "INSERT INTO products (name, description, price, sku) VALUES (?, ?, ?, ?) \
-         RETURNING id, name, description, price, sku, created_at, updated_at, deleted_at",
+    sqlx::query(
+        "INSERT INTO products (name, description, price, sku) VALUES (?, ?, ?, ?)",
     )
     .bind(name)
     .bind(description)
     .bind(price)
     .bind(sku)
-    .fetch_one(pool)
-    .await
+    .execute(pool)
+    .await?;
+
+    find_by_sku(pool, sku)
+        .await
+        .map(|p| p.unwrap())
 }
 
 pub async fn update(
@@ -62,7 +65,7 @@ pub async fn update(
         sets.join(", ")
     );
 
-    let mut q = sqlx::query_as::<_, Product>(&sql);
+    let mut q = sqlx::query(&sql);
     if let Some(v) = name {
         q = q.bind(v);
     }
@@ -77,7 +80,12 @@ pub async fn update(
     }
     q = q.bind(id);
 
-    q.fetch_optional(pool).await
+    let result = q.execute(pool).await?;
+    if result.rows_affected() > 0 {
+        find_by_id(pool, id).await
+    } else {
+        Ok(None)
+    }
 }
 
 pub async fn soft_delete(pool: &MySqlPool, id: i64) -> Result<bool, sqlx::Error> {

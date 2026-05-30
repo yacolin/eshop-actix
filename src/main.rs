@@ -3,6 +3,7 @@ use actix_web::{App, HttpServer, Responder, get, post, web};
 use serde::Serialize;
 
 mod api;
+mod cache;
 mod db;
 mod dto;
 mod error;
@@ -12,8 +13,9 @@ mod repository;
 mod service;
 
 use api::response;
-use middleware::error_handler::{set_global_panic_hook, ErrorHandler};
-use middleware::trace::{get_trace_id, TraceMiddleware};
+use middleware::error_handler::{ErrorHandler, set_global_panic_hook};
+use middleware::trace::{TraceMiddleware, get_trace_id};
+use service::product_cache::ProductCache;
 
 #[get("/")]
 async fn hello() -> impl Responder {
@@ -75,11 +77,24 @@ async fn main() -> std::io::Result<()> {
 
     let pool = db::init_pool().await;
 
+    let cache = match cache::init_redis().await {
+        Ok(conn) => {
+            log::info!("Redis connection established");
+            ProductCache::new(Some(conn))
+        }
+        Err(e) => {
+            log::warn!("Redis not available, caching disabled: {e}");
+            ProductCache::new(None)
+        }
+    };
+    let cache_data = web::Data::new(cache);
+
     log::info!("Starting server at http://127.0.0.1:8080");
 
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(pool.clone()))
+            .app_data(cache_data.clone())
             .wrap(TraceMiddleware)
             .wrap(ErrorHandler)
             .wrap(Logger::new("%t | %r | %s | %b bytes | %Dµs"))
@@ -94,6 +109,9 @@ async fn main() -> std::io::Result<()> {
                 web::scope("/api/v1/products")
                     .route("", web::post().to(api::product::create))
                     .route("", web::get().to(api::product::list))
+                    .route("/cache", web::get().to(api::product::list_cached))
+                    .route("/cache/{id}", web::get().to(api::product::get_by_id_cached))
+                    .route("/warmup", web::post().to(api::product::warmup))
                     .route("/{id}", web::get().to(api::product::get_by_id))
                     .route("/{id}", web::put().to(api::product::update))
                     .route("/{id}", web::delete().to(api::product::delete)),

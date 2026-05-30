@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::models::product::Product;
+
 #[derive(Debug, Deserialize)]
 pub struct CreateProductRequest {
     pub name: String,
@@ -41,8 +43,16 @@ pub struct ProductListResponse {
     pub total: i64,
 }
 
-impl From<crate::models::product::Product> for ProductResponse {
-    fn from(p: crate::models::product::Product) -> Self {
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CachedProductItem {
+    pub id: i64,
+    pub name: String,
+    pub price: i64,
+    pub sku: String,
+}
+
+impl From<Product> for ProductResponse {
+    fn from(p: Product) -> Self {
         ProductResponse {
             id: p.id,
             name: p.name,
@@ -51,6 +61,42 @@ impl From<crate::models::product::Product> for ProductResponse {
             sku: p.sku,
             created_at: p.created_at,
             updated_at: p.updated_at,
+        }
+    }
+}
+
+impl From<&CachedProductItem> for ProductResponse {
+    fn from(cached: &CachedProductItem) -> Self {
+        ProductResponse {
+            id: cached.id,
+            name: cached.name.clone(),
+            description: None,
+            price: cached.price,
+            sku: cached.sku.clone(),
+            created_at: None,
+            updated_at: None,
+        }
+    }
+}
+
+impl From<Product> for CachedProductItem {
+    fn from(p: Product) -> Self {
+        CachedProductItem {
+            id: p.id,
+            name: p.name,
+            price: p.price,
+            sku: p.sku,
+        }
+    }
+}
+
+impl From<&Product> for CachedProductItem {
+    fn from(p: &Product) -> Self {
+        CachedProductItem {
+            id: p.id,
+            name: p.name.clone(),
+            price: p.price,
+            sku: p.sku.clone(),
         }
     }
 }
