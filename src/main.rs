@@ -79,21 +79,27 @@ async fn main() -> std::io::Result<()> {
 
     let pool = db::init_pool().await;
 
-    let redis_conns = cache::init_redis().await;
-    let (product_conns, inventory_conns) = match redis_conns {
-        Ok(mut conns) => {
-            let inventory = conns.split_off(conns.len() / 2);
-            (Some(conns), Some(inventory))
+    let product_conns = match cache::init_redis().await {
+        Ok(conns) => {
+            log::info!("Product Redis pool established ({} connections)", conns.len());
+            Some(conns)
         }
         Err(e) => {
-            log::warn!("Redis not available, caching disabled: {e}");
-            (None, None)
+            log::warn!("Redis not available, product caching disabled: {e}");
+            None
         }
     };
 
-    let total = product_conns.as_ref().map(|c| c.len()).unwrap_or(0)
-        + inventory_conns.as_ref().map(|c| c.len()).unwrap_or(0);
-    log::info!("Redis connection pool established ({} connections)", total);
+    let inventory_conns = match cache::init_redis().await {
+        Ok(conns) => {
+            log::info!("Inventory Redis pool established ({} connections)", conns.len());
+            Some(conns)
+        }
+        Err(e) => {
+            log::warn!("Redis not available, inventory caching disabled: {e}");
+            None
+        }
+    };
 
     let product_cache = web::Data::new(ProductCache::new(product_conns));
     let inventory_cache = web::Data::new(InventoryCache::new(inventory_conns));
