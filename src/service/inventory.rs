@@ -3,8 +3,11 @@ use sqlx::MySqlPool;
 use crate::dto::inventory::{
     CreateInventoryRequest, InventoryListResponse, InventoryResponse, UpdateInventoryRequest,
 };
-use crate::error::{BizError, ERR_INTERNAL_SERVER, ERR_INVENTORY_NOT_FOUND, ERR_DUPLICATE_INVENTORY};
+use crate::error::{BizError, ERR_DUPLICATE_INVENTORY, ERR_INTERNAL_SERVER, ERR_INVENTORY_NOT_FOUND};
 use crate::repository;
+use crate::service::inventory_cache::{CachedItemResult, CachedListResult, InventoryCache};
+
+// ====== Non-cached (direct DB) ======
 
 pub async fn get_inventory(pool: &MySqlPool, id: i64) -> Result<InventoryResponse, BizError> {
     let inventory = repository::inventory::find_by_id(pool, id)
@@ -37,6 +40,7 @@ pub async fn get_inventory_by_product_id(
 
 pub async fn create_inventory(
     pool: &MySqlPool,
+    cache: Option<&InventoryCache>,
     req: CreateInventoryRequest,
 ) -> Result<InventoryResponse, BizError> {
     if req.quantity < 0 {
@@ -67,11 +71,18 @@ pub async fn create_inventory(
         ERR_INTERNAL_SERVER
     })?;
 
-    Ok(InventoryResponse::from(inventory))
+    let resp = InventoryResponse::from(inventory);
+
+    if let Some(cache) = cache {
+        cache.evict(resp.id, resp.product_id).await;
+    }
+
+    Ok(resp)
 }
 
 pub async fn update_inventory(
     pool: &MySqlPool,
+    cache: Option<&InventoryCache>,
     id: i64,
     req: UpdateInventoryRequest,
 ) -> Result<InventoryResponse, BizError> {
@@ -101,13 +112,35 @@ pub async fn update_inventory(
         ERR_INTERNAL_SERVER
     })?;
 
-    inventory
+    let resp = inventory
         .map(InventoryResponse::from)
-        .ok_or(ERR_INVENTORY_NOT_FOUND)
+        .ok_or(ERR_INVENTORY_NOT_FOUND)?;
+
+    if let Some(cache) = cache {
+        cache.evict(resp.id, resp.product_id).await;
+    }
+
+    Ok(resp)
 }
 
-pub async fn delete_inventory(pool: &MySqlPool, id: i64) -> Result<(), BizError> {
-    let deleted = repository::inventory::soft_delete(pool, id)
+pub async fn delete_inventory(
+    pool: &MySqlPool,
+    cache: Option<&InventoryCache>,
+    id: i64,
+) -> Result<(), BizError> {
+    let inventory = repository::inventory::find_by_id(pool, id)
+        .await
+        .map_err(|e| {
+            log::error!("[inventory_service] find_by_id error: {e}");
+            ERR_INTERNAL_SERVER
+        })?;
+
+    let (inventory_id, product_id) = match inventory {
+        Some(i) => (i.id, i.product_id),
+        None => return Err(ERR_INVENTORY_NOT_FOUND),
+    };
+
+    let deleted = repository::inventory::soft_delete(pool, inventory_id)
         .await
         .map_err(|e| {
             log::error!("[inventory_service] soft_delete error: {e}");
@@ -115,6 +148,9 @@ pub async fn delete_inventory(pool: &MySqlPool, id: i64) -> Result<(), BizError>
         })?;
 
     if deleted {
+        if let Some(cache) = cache {
+            cache.evict(inventory_id, product_id).await;
+        }
         Ok(())
     } else {
         Err(ERR_INVENTORY_NOT_FOUND)
@@ -147,4 +183,39 @@ pub async fn list_inventories(
         list: inventories.into_iter().map(InventoryResponse::from).collect(),
         total,
     })
+}
+
+// ====== Cached variants ======
+
+pub async fn get_inventory_cached(
+    pool: &MySqlPool,
+    cache: &InventoryCache,
+    id: i64,
+) -> Result<CachedItemResult, BizError> {
+    cache.get_by_id(pool, id).await
+}
+
+pub async fn get_inventory_by_product_id_cached(
+    pool: &MySqlPool,
+    cache: &InventoryCache,
+    product_id: i64,
+) -> Result<CachedItemResult, BizError> {
+    cache.get_by_product_id(pool, product_id).await
+}
+
+pub async fn list_inventories_cached(
+    pool: &MySqlPool,
+    cache: &InventoryCache,
+    status: Option<&str>,
+    page: u32,
+    page_size: u32,
+) -> Result<CachedListResult, BizError> {
+    cache.list(pool, status, page, page_size).await
+}
+
+pub async fn warmup_inventory_cache(
+    pool: &MySqlPool,
+    cache: &InventoryCache,
+) -> Result<i32, BizError> {
+    cache.warmup(pool).await
 }

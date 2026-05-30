@@ -16,6 +16,7 @@ use api::response;
 use middleware::error_handler::{ErrorHandler, set_global_panic_hook};
 use middleware::logger::ConditionalLogger;
 use middleware::trace::{ConditionalTrace, get_trace_id};
+use service::inventory_cache::InventoryCache;
 use service::product_cache::ProductCache;
 
 #[get("/")]
@@ -78,17 +79,24 @@ async fn main() -> std::io::Result<()> {
 
     let pool = db::init_pool().await;
 
-    let cache = match cache::init_redis().await {
-        Ok(conns) => {
-            log::info!("Redis connection pool established ({} connections)", conns.len());
-            ProductCache::new(Some(conns))
+    let redis_conns = cache::init_redis().await;
+    let (product_conns, inventory_conns) = match redis_conns {
+        Ok(mut conns) => {
+            let inventory = conns.split_off(conns.len() / 2);
+            (Some(conns), Some(inventory))
         }
         Err(e) => {
             log::warn!("Redis not available, caching disabled: {e}");
-            ProductCache::new(None)
+            (None, None)
         }
     };
-    let cache_data = web::Data::new(cache);
+
+    let total = product_conns.as_ref().map(|c| c.len()).unwrap_or(0)
+        + inventory_conns.as_ref().map(|c| c.len()).unwrap_or(0);
+    log::info!("Redis connection pool established ({} connections)", total);
+
+    let product_cache = web::Data::new(ProductCache::new(product_conns));
+    let inventory_cache = web::Data::new(InventoryCache::new(inventory_conns));
 
     log::info!("Starting server at http://127.0.0.1:8080");
 
@@ -100,7 +108,8 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(pool.clone()))
-            .app_data(cache_data.clone())
+            .app_data(product_cache.clone())
+            .app_data(inventory_cache.clone())
             .wrap(ConditionalTrace)
             .wrap(ConditionalLogger)
             .wrap(ErrorHandler)
@@ -126,6 +135,10 @@ async fn main() -> std::io::Result<()> {
                 web::scope("/api/v1/inventory")
                     .route("", web::post().to(api::inventory::create))
                     .route("", web::get().to(api::inventory::list))
+                    .route("/cache", web::get().to(api::inventory::list_cached))
+                    .route("/cache/{id}", web::get().to(api::inventory::get_by_id_cached))
+                    .route("/cache/product/{product_id}", web::get().to(api::inventory::get_by_product_id_cached))
+                    .route("/warmup", web::post().to(api::inventory::warmup))
                     .route("/product/{product_id}", web::get().to(api::inventory::get_by_product_id))
                     .route("/{id}", web::get().to(api::inventory::get_by_id))
                     .route("/{id}", web::put().to(api::inventory::update))
