@@ -1,7 +1,9 @@
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use redis::Script;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use sqlx::MySqlPool;
@@ -13,8 +15,32 @@ use crate::repository;
 
 const INVENTORY_INFO_PREFIX: &str = "inventory:info:";
 const INVENTORY_PRODUCT_PREFIX: &str = "inventory:product:";
+const INVENTORY_CACHE_ZSET: &str = "inventory:zset";
 const LOCAL_CACHE_TTL: Duration = Duration::from_secs(60);
 const LOCAL_LIST_CACHE_TTL: Duration = Duration::from_secs(30);
+
+// ====== Lua Script ======
+
+static ZRANGE_MGET_SCRIPT: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r#"
+local ids
+if ARGV[3] == "desc" then
+    ids = redis.call("ZREVRANGE", KEYS[1], ARGV[1], ARGV[2])
+else
+    ids = redis.call("ZRANGE", KEYS[1], ARGV[1], ARGV[2])
+end
+local total = redis.call("ZCARD", KEYS[1])
+if #ids == 0 then return {total, {}} end
+local keys = {}
+for i, id in ipairs(ids) do
+    keys[i] = ARGV[4] .. id
+end
+local values = redis.call("MGET", unpack(keys))
+return {total, values}
+"#,
+    )
+});
 
 // ====== Cached Item ======
 
@@ -323,6 +349,43 @@ impl InnerCache {
             .arg(&[info_key.as_str(), product_key.as_str()])
             .query_async(&mut *conn)
             .await;
+        let _: redis::RedisResult<()> = redis::cmd("ZREM")
+            .arg(INVENTORY_CACHE_ZSET)
+            .arg(id)
+            .query_async(&mut *conn)
+            .await;
+    }
+
+    fn parse_zset_result(val: redis::Value) -> Option<(i64, Vec<String>)> {
+        match val {
+            redis::Value::Bulk(items) if items.len() == 2 => {
+                let total = match &items[0] {
+                    redis::Value::Int(n) => *n,
+                    redis::Value::Data(bytes) => {
+                        String::from_utf8_lossy(bytes).parse::<i64>().ok()?
+                    }
+                    _ => return None,
+                };
+
+                let values = match &items[1] {
+                    redis::Value::Bulk(arr) => arr
+                        .iter()
+                        .filter_map(|v| match v {
+                            redis::Value::Data(bytes) => {
+                                Some(String::from_utf8_lossy(bytes).to_string())
+                            }
+                            redis::Value::Nil => None,
+                            _ => None,
+                        })
+                        .collect(),
+                    redis::Value::Nil => vec![],
+                    _ => return None,
+                };
+
+                Some((total, values))
+            }
+            _ => None,
+        }
     }
 
     async fn list(
@@ -332,40 +395,96 @@ impl InnerCache {
         page: u32,
         page_size: u32,
     ) -> Result<CachedListResult, BizError> {
-        let status_key = status.unwrap_or("").to_string();
+        if status.is_some() {
+            let offset = (page - 1) * page_size;
+            let inventories = repository::inventory::find_list(pool, status, offset, page_size)
+                .await
+                .map_err(|e| {
+                    log::error!("[inventory_cache] find_list error: {e}");
+                    ERR_INTERNAL_SERVER
+                })?;
+
+            let total = repository::inventory::count_list(pool, status)
+                .await
+                .map_err(|e| {
+                    log::error!("[inventory_cache] count_list error: {e}");
+                    ERR_INTERNAL_SERVER
+                })?;
+
+            return Ok(CachedListResult::Fresh(InventoryListResponse {
+                list: inventories.into_iter().map(InventoryResponse::from).collect(),
+                total,
+            }));
+        }
+
+        let status_key = String::new();
         if let Some(full) = self.local.get_list(page, page_size, &status_key) {
             return Ok(CachedListResult::FullResponse(full));
         }
 
-        let offset = (page - 1) * page_size;
-        let inventories = repository::inventory::find_list(pool, status, offset, page_size)
+        let offset = (page.saturating_sub(1)) as i64;
+        let stop = offset + page_size as i64 - 1;
+
+        let mut conn = self.get_conn().lock().await;
+
+        let result: redis::RedisResult<redis::Value> = ZRANGE_MGET_SCRIPT
+            .key(INVENTORY_CACHE_ZSET)
+            .arg(offset)
+            .arg(stop)
+            .arg("desc")
+            .arg(INVENTORY_INFO_PREFIX)
+            .invoke_async(&mut *conn)
+            .await;
+
+        match result {
+            Ok(val) => {
+                if let Some((total, items)) = Self::parse_zset_result(val) {
+                    if total > 0 {
+                        let inventories: Vec<InventoryResponse> = items
+                            .iter()
+                            .filter_map(|json| serde_json::from_str::<CachedInventoryItem>(json).ok())
+                            .map(|cached| InventoryResponse::from(&cached))
+                            .collect();
+                        if !inventories.is_empty() {
+                            let resp = InventoryListResponse {
+                                list: inventories,
+                                total,
+                            };
+                            if let Ok(list_bytes) = serde_json::to_vec(&resp) {
+                                let full = bytes::Bytes::from(build_full_response(&list_bytes));
+                                self.local.set_list(page, page_size, status_key, full.clone());
+                                return Ok(CachedListResult::FullResponse(full));
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("[inventory_cache] Redis ZSET list failed, falling back to DB: {e}");
+            }
+        }
+
+        drop(conn);
+
+        let db_offset = (page - 1) * page_size;
+        let inventories = repository::inventory::find_list(pool, None, db_offset, page_size)
             .await
             .map_err(|e| {
                 log::error!("[inventory_cache] find_list error: {e}");
                 ERR_INTERNAL_SERVER
             })?;
 
-        let total = repository::inventory::count_list(pool, status)
+        let total = repository::inventory::count_list(pool, None)
             .await
             .map_err(|e| {
                 log::error!("[inventory_cache] count_list error: {e}");
                 ERR_INTERNAL_SERVER
             })?;
 
-        let resp = InventoryListResponse {
+        Ok(CachedListResult::Fresh(InventoryListResponse {
             list: inventories.into_iter().map(InventoryResponse::from).collect(),
             total,
-        };
-
-        if status.is_none() {
-            if let Ok(list_bytes) = serde_json::to_vec(&resp) {
-                let full = bytes::Bytes::from(build_full_response(&list_bytes));
-                self.local.set_list(page, page_size, status_key, full.clone());
-                return Ok(CachedListResult::FullResponse(full));
-            }
-        }
-
-        Ok(CachedListResult::Fresh(resp))
+        }))
     }
 
     async fn warmup(&self, pool: &MySqlPool) -> Result<i32, BizError> {
@@ -377,10 +496,16 @@ impl InnerCache {
             })?;
 
         let count = inventories.len() as i32;
+        let ids: Vec<i64> = inventories.iter().map(|i| i.id).collect();
         let items: Vec<CachedInventoryItem> =
             inventories.into_iter().map(CachedInventoryItem::from).collect();
 
         let mut conn = self.get_conn().lock().await;
+
+        let _: redis::RedisResult<()> = redis::cmd("DEL")
+            .arg(INVENTORY_CACHE_ZSET)
+            .query_async(&mut *conn)
+            .await;
 
         for item in &items {
             if let Ok(json) = serde_json::to_string(item) {
@@ -396,11 +521,63 @@ impl InnerCache {
                     .arg(&json)
                     .query_async(&mut *conn)
                     .await;
+                let _: redis::RedisResult<()> = redis::cmd("ZADD")
+                    .arg(INVENTORY_CACHE_ZSET)
+                    .arg(item.id)
+                    .arg(item.id)
+                    .query_async(&mut *conn)
+                    .await;
             }
         }
 
         drop(conn);
         self.local.warmup_all(items);
+
+        // pre-warm local list cache with first 3 pages
+        let page_sizes = [10u32, 20u32, 50u32];
+        for page_size in page_sizes {
+            let total = ids.len() as i64;
+            let mut page = 1u32;
+            loop {
+                let offset = ((page.saturating_sub(1)) as i64).min(ids.len() as i64 - 1);
+                let stop = (offset + page_size as i64 - 1).min(ids.len() as i64 - 1);
+                if offset > stop {
+                    break;
+                }
+                let page_ids: Vec<i64> = ids.iter()
+                    .rev()
+                    .skip(offset as usize)
+                    .take((stop - offset + 1) as usize)
+                    .copied()
+                    .collect();
+                let list: Vec<InventoryResponse> = page_ids.iter()
+                    .filter_map(|id| self.local.get_by_id(*id))
+                    .filter_map(|full| {
+                        let bytes = &full[..];
+                        let data_prefix = b"\"data\":";
+                        if let Some(pos) = bytes.windows(data_prefix.len()).position(|w| w == data_prefix) {
+                            let data_start = pos + data_prefix.len();
+                            serde_json::from_slice::<CachedInventoryItem>(&bytes[data_start..]).ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .map(|cached| InventoryResponse::from(&cached))
+                    .collect();
+                if list.is_empty() {
+                    break;
+                }
+                let resp = InventoryListResponse { list, total };
+                if let Ok(list_bytes) = serde_json::to_vec(&resp) {
+                    let full = bytes::Bytes::from(build_full_response(&list_bytes));
+                    self.local.set_list(page, page_size, String::new(), full);
+                }
+                page += 1;
+                if offset as usize + page_size as usize >= ids.len() {
+                    break;
+                }
+            }
+        }
 
         Ok(count)
     }
