@@ -108,10 +108,6 @@ impl LocalCache {
         self.single_by_id.insert(id, (Instant::now(), bytes));
     }
 
-    fn remove_by_id(&self, id: i64) {
-        self.single_by_id.remove(&id);
-    }
-
     fn get_by_product_id(&self, product_id: i64) -> Option<bytes::Bytes> {
         if let Some(entry) = self.single_by_product.get(&product_id) {
             if entry.0.elapsed() < LOCAL_CACHE_TTL {
@@ -124,10 +120,6 @@ impl LocalCache {
     fn set_by_product_id(&self, product_id: i64, bytes: bytes::Bytes) {
         self.single_by_product
             .insert(product_id, (Instant::now(), bytes));
-    }
-
-    fn remove_by_product_id(&self, product_id: i64) {
-        self.single_by_product.remove(&product_id);
     }
 
     fn remove_any(&self, id: i64, product_id: i64) {
@@ -148,10 +140,6 @@ impl LocalCache {
     fn set_list(&self, page: u32, page_size: u32, status: String, bytes: bytes::Bytes) {
         self.lists
             .insert((page, page_size, status), (Instant::now(), bytes));
-    }
-
-    fn clear_lists(&self) {
-        self.lists.clear();
     }
 
     fn warmup_all(&self, items: Vec<CachedInventoryItem>) {
