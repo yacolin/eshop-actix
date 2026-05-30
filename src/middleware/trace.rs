@@ -4,9 +4,9 @@ use actix_web::dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Tr
 use actix_web::{Error, HttpMessage};
 use uuid::Uuid;
 
-pub struct TraceMiddleware;
+pub struct ConditionalTrace;
 
-impl<S, B> Transform<S, ServiceRequest> for TraceMiddleware
+impl<S, B> Transform<S, ServiceRequest> for ConditionalTrace
 where
     S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
     S::Future: 'static,
@@ -14,20 +14,20 @@ where
 {
     type Response = ServiceResponse<B>;
     type Error = Error;
-    type Transform = TraceMiddlewareService<S>;
+    type Transform = ConditionalTraceService<S>;
     type InitError = ();
     type Future = Ready<Result<Self::Transform, Self::InitError>>;
 
     fn new_transform(&self, service: S) -> Self::Future {
-        ready(Ok(TraceMiddlewareService { service }))
+        ready(Ok(ConditionalTraceService { service }))
     }
 }
 
-pub struct TraceMiddlewareService<S> {
+pub struct ConditionalTraceService<S> {
     service: S,
 }
 
-impl<S, B> Service<ServiceRequest> for TraceMiddlewareService<S>
+impl<S, B> Service<ServiceRequest> for ConditionalTraceService<S>
 where
     S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
     S::Future: 'static,
@@ -40,10 +40,16 @@ where
     forward_ready!(service);
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
-        let trace_id = Uuid::new_v4().to_string();
-        req.extensions_mut().insert(TraceId(trace_id));
+        if needs_trace_id(req.path()) {
+            let trace_id = Uuid::new_v4().to_string();
+            req.extensions_mut().insert(TraceId(trace_id));
+        }
         self.service.call(req)
     }
+}
+
+fn needs_trace_id(path: &str) -> bool {
+    !path.contains("/cache/") && !path.ends_with("/cache") && !path.ends_with("/warmup")
 }
 
 #[derive(Debug, Clone)]

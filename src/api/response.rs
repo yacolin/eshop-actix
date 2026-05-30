@@ -23,29 +23,6 @@ pub fn success<T: Serialize>(data: T) -> HttpResponse {
     })
 }
 
-pub fn success_from_bytes(data_bytes: Vec<u8>) -> HttpResponse {
-    let mut body = Vec::with_capacity(data_bytes.len() + 64);
-    body.extend_from_slice(b"{\"code\":0,\"message\":\"success\",\"data\":");
-    body.extend_from_slice(&data_bytes);
-    body.push(b'}');
-    HttpResponse::Ok()
-        .content_type("application/json")
-        .body(body)
-}
-
-pub fn success_from_bytes_with_trace(data_bytes: Vec<u8>, trace_id: String) -> HttpResponse {
-    let trace_json = serde_json::to_string(&trace_id).unwrap_or_default();
-    let mut body = Vec::with_capacity(data_bytes.len() + 128);
-    body.extend_from_slice(b"{\"code\":0,\"message\":\"success\",\"data\":");
-    body.extend_from_slice(&data_bytes);
-    body.extend_from_slice(b",\"trace_id\":");
-    body.extend_from_slice(trace_json.as_bytes());
-    body.push(b'}');
-    HttpResponse::Ok()
-        .content_type("application/json")
-        .body(body)
-}
-
 pub fn success_with_trace<T: Serialize>(data: T, trace_id: String) -> HttpResponse {
     HttpResponse::Ok().json(ApiResponse {
         code: 0,

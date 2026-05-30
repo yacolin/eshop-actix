@@ -1,6 +1,6 @@
-use actix_web::middleware::Logger;
 use actix_web::{App, HttpServer, Responder, get, post, web};
 use serde::Serialize;
+use std::thread;
 
 mod api;
 mod cache;
@@ -14,7 +14,7 @@ mod service;
 
 use api::response;
 use middleware::error_handler::{ErrorHandler, set_global_panic_hook};
-use middleware::trace::{TraceMiddleware, get_trace_id};
+use middleware::trace::{ConditionalTrace, get_trace_id};
 use service::product_cache::ProductCache;
 
 #[get("/")]
@@ -91,13 +91,17 @@ async fn main() -> std::io::Result<()> {
 
     log::info!("Starting server at http://127.0.0.1:8080");
 
+    let num_workers = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(4);
+
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(pool.clone()))
             .app_data(cache_data.clone())
-            .wrap(TraceMiddleware)
+            .wrap(ConditionalTrace)
             .wrap(ErrorHandler)
-            .wrap(Logger::new("%t | %r | %s | %b bytes | %Dms"))
             .service(hello)
             .service(echo)
             .service(db_status)
@@ -118,6 +122,9 @@ async fn main() -> std::io::Result<()> {
             )
             .default_service(web::to(not_found))
     })
+    .workers(num_workers)
+    .backlog(4096)
+    .max_connections(25000)
     .bind(("127.0.0.1", 8080))?
     .run()
     .await

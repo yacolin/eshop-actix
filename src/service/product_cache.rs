@@ -1,7 +1,5 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::LazyLock;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -13,15 +11,25 @@ use crate::dto::product::{CachedProductItem, ProductListResponse, ProductRespons
 use crate::error::{BizError, ERR_INTERNAL_SERVER, ERR_PRODUCT_NOT_FOUND};
 use crate::repository;
 
+// ====== Helper: wrap data bytes into full ApiResponse JSON ======
+
+fn build_full_response(data_bytes: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(data_bytes.len() + 64);
+    buf.extend_from_slice(b"{\"code\":0,\"message\":\"success\",\"data\":");
+    buf.extend_from_slice(data_bytes);
+    buf.push(b'}');
+    buf
+}
+
 // ====== Cached Response Types (pre-serialized bytes) ======
 
 pub enum CachedItemResult {
-    Serialized(Vec<u8>),
+    FullResponse(bytes::Bytes),
     Fresh(ProductResponse),
 }
 
 pub enum CachedListResult {
-    Serialized(Vec<u8>),
+    FullResponse(bytes::Bytes),
     Fresh(ProductListResponse),
 }
 
@@ -64,15 +72,20 @@ return {total, values}
 // ====== Bloom Filter ======
 
 struct BloomFilter {
-    bits: Mutex<Vec<u64>>,
+    bits: Vec<AtomicU64>,
     size: usize,
     num_hashes: u32,
 }
 
 impl BloomFilter {
     fn new(size: usize, num_hashes: u32) -> Self {
+        let word_count = (size + 63) / 64;
+        let mut bits = Vec::with_capacity(word_count);
+        for _ in 0..word_count {
+            bits.push(AtomicU64::new(0));
+        }
         BloomFilter {
-            bits: Mutex::new(vec![0u64; (size + 63) / 64]),
+            bits,
             size,
             num_hashes,
         }
@@ -87,18 +100,20 @@ impl BloomFilter {
     }
 
     fn add(&self, id: i64) {
-        let mut bits = self.bits.lock().unwrap();
         for i in 0..self.num_hashes {
             let idx = self.hash(id, i);
-            bits[idx / 64] |= 1u64 << (idx % 64);
+            let word_idx = idx / 64;
+            let bit_idx = idx % 64;
+            self.bits[word_idx].fetch_or(1u64 << bit_idx, Ordering::Relaxed);
         }
     }
 
     fn may_exist(&self, id: i64) -> bool {
-        let bits = self.bits.lock().unwrap();
         for i in 0..self.num_hashes {
             let idx = self.hash(id, i);
-            if bits[idx / 64] & (1u64 << (idx % 64)) == 0 {
+            let word_idx = idx / 64;
+            let bit_idx = idx % 64;
+            if self.bits[word_idx].load(Ordering::Relaxed) & (1u64 << bit_idx) == 0 {
                 return false;
             }
         }
@@ -106,8 +121,9 @@ impl BloomFilter {
     }
 
     fn clear(&self) {
-        let mut bits = self.bits.lock().unwrap();
-        bits.iter_mut().for_each(|b| *b = 0);
+        for word in &self.bits {
+            word.store(0, Ordering::Relaxed);
+        }
     }
 
     fn add_all(&self, ids: &[i64]) {
@@ -120,20 +136,19 @@ impl BloomFilter {
 // ====== Hot Key Counter ======
 
 struct HotKeyCounter {
-    counters: Mutex<HashMap<i64, (u64, Instant)>>,
+    counters: DashMap<i64, (u64, Instant)>,
 }
 
 impl HotKeyCounter {
     fn new() -> Self {
         HotKeyCounter {
-            counters: Mutex::new(HashMap::new()),
+            counters: DashMap::new(),
         }
     }
 
     fn increment(&self, id: i64) -> bool {
-        let mut counters = self.counters.lock().unwrap();
         let now = Instant::now();
-        let entry = counters.entry(id).or_insert((0, now));
+        let mut entry = self.counters.entry(id).or_insert((0, now));
         if now.duration_since(entry.1) > HOT_KEY_WINDOW {
             *entry = (0, now);
         }
@@ -143,28 +158,27 @@ impl HotKeyCounter {
 
     #[allow(dead_code)]
     fn reset(&self, id: i64) {
-        let mut counters = self.counters.lock().unwrap();
-        counters.remove(&id);
+        self.counters.remove(&id);
     }
 }
 
 // ====== Local Cache ======
 
 struct LocalCache {
-    single_bytes: DashMap<i64, (Instant, Vec<u8>)>,
-    list_bytes: DashMap<(u32, u32), (Instant, Vec<u8>)>,
+    single_full: DashMap<i64, (Instant, bytes::Bytes)>,
+    list_full: DashMap<(u32, u32), (Instant, bytes::Bytes)>,
 }
 
 impl LocalCache {
     fn new() -> Self {
         LocalCache {
-            single_bytes: DashMap::new(),
-            list_bytes: DashMap::new(),
+            single_full: DashMap::new(),
+            list_full: DashMap::new(),
         }
     }
 
-    fn get_single_bytes(&self, id: i64) -> Option<Vec<u8>> {
-        if let Some(entry) = self.single_bytes.get(&id) {
+    fn get_single_full(&self, id: i64) -> Option<bytes::Bytes> {
+        if let Some(entry) = self.single_full.get(&id) {
             if entry.0.elapsed() < LOCAL_CACHE_TTL {
                 return Some(entry.1.clone());
             }
@@ -172,16 +186,16 @@ impl LocalCache {
         None
     }
 
-    fn set_single_bytes(&self, id: i64, bytes: Vec<u8>) {
-        self.single_bytes.insert(id, (Instant::now(), bytes));
+    fn set_single_full(&self, id: i64, bytes: bytes::Bytes) {
+        self.single_full.insert(id, (Instant::now(), bytes));
     }
 
     fn remove_single(&self, id: i64) {
-        self.single_bytes.remove(&id);
+        self.single_full.remove(&id);
     }
 
-    fn get_list_bytes(&self, page: u32, page_size: u32) -> Option<Vec<u8>> {
-        if let Some(entry) = self.list_bytes.get(&(page, page_size)) {
+    fn get_list_full(&self, page: u32, page_size: u32) -> Option<bytes::Bytes> {
+        if let Some(entry) = self.list_full.get(&(page, page_size)) {
             if entry.0.elapsed() < LOCAL_LIST_CACHE_TTL {
                 return Some(entry.1.clone());
             }
@@ -189,19 +203,20 @@ impl LocalCache {
         None
     }
 
-    fn set_list_bytes(&self, page: u32, page_size: u32, bytes: Vec<u8>) {
-        self.list_bytes
+    fn set_list_full(&self, page: u32, page_size: u32, bytes: bytes::Bytes) {
+        self.list_full
             .insert((page, page_size), (Instant::now(), bytes));
     }
 
     fn clear_lists(&self) {
-        self.list_bytes.clear();
+        self.list_full.clear();
     }
 
     fn warmup_singles(&self, items: Vec<CachedProductItem>) {
         for item in items {
-            if let Ok(bytes) = serde_json::to_vec(&item) {
-                self.set_single_bytes(item.id, bytes);
+            if let Ok(item_bytes) = serde_json::to_vec(&item) {
+                let full = bytes::Bytes::from(build_full_response(&item_bytes));
+                self.set_single_full(item.id, full);
             }
         }
     }
@@ -230,9 +245,9 @@ impl InnerCache {
         let redis_key = format!("{}{}", PRODUCT_INFO_PREFIX, id);
 
         if self.bloom.may_exist(id) {
-            if let Some(bytes) = self.local.get_single_bytes(id) {
+            if let Some(full) = self.local.get_single_full(id) {
                 self.hot_counter.increment(id);
-                return Ok(CachedItemResult::Serialized(bytes));
+                return Ok(CachedItemResult::FullResponse(full));
             }
         }
 
@@ -246,9 +261,10 @@ impl InnerCache {
         match result {
             Ok(Some(data)) if data != EMPTY_PLACEHOLDER => {
                 if let Ok(item) = serde_json::from_str::<CachedProductItem>(&data) {
-                    if let Ok(bytes) = serde_json::to_vec(&item) {
-                        self.local.set_single_bytes(id, bytes.clone());
-                        return Ok(CachedItemResult::Serialized(bytes));
+                    if let Ok(item_bytes) = serde_json::to_vec(&item) {
+                        let full = bytes::Bytes::from(build_full_response(&item_bytes));
+                        self.local.set_single_full(id, full.clone());
+                        return Ok(CachedItemResult::FullResponse(full));
                     }
                 }
             }
@@ -268,8 +284,9 @@ impl InnerCache {
         match product {
             Some(p) => {
                 let cached = CachedProductItem::from(&p);
-                if let Ok(bytes) = serde_json::to_vec(&cached) {
-                    self.local.set_single_bytes(id, bytes);
+                if let Ok(item_bytes) = serde_json::to_vec(&cached) {
+                    let full = bytes::Bytes::from(build_full_response(&item_bytes));
+                    self.local.set_single_full(id, full);
                 }
 
                 if let Ok(json) = serde_json::to_string(&cached) {
@@ -306,8 +323,8 @@ impl InnerCache {
             return Ok(CachedListResult::Fresh(resp));
         }
 
-        if let Some(bytes) = self.local.get_list_bytes(page, page_size) {
-            return Ok(CachedListResult::Serialized(bytes));
+        if let Some(full) = self.local.get_list_full(page, page_size) {
+            return Ok(CachedListResult::FullResponse(full));
         }
 
         let offset = (page.saturating_sub(1)) as i64;
@@ -338,9 +355,10 @@ impl InnerCache {
                                 list: products,
                                 total,
                             };
-                            if let Ok(bytes) = serde_json::to_vec(&resp) {
-                                self.local.set_list_bytes(page, page_size, bytes.clone());
-                                return Ok(CachedListResult::Serialized(bytes));
+                            if let Ok(list_bytes) = serde_json::to_vec(&resp) {
+                                let full = bytes::Bytes::from(build_full_response(&list_bytes));
+                                self.local.set_list_full(page, page_size, full.clone());
+                                return Ok(CachedListResult::FullResponse(full));
                             }
                         }
                     }
@@ -475,16 +493,28 @@ impl InnerCache {
                     .copied()
                     .collect();
                 let list: Vec<ProductResponse> = page_ids.iter()
-                    .filter_map(|id| self.local.get_single_bytes(*id))
-                    .filter_map(|bytes| serde_json::from_slice::<CachedProductItem>(&bytes).ok())
+                    .filter_map(|id| self.local.get_single_full(*id))
+                    .filter_map(|full| {
+                        // extract data portion from full response: {"code":0,"message":"success","data":{...}}
+                        // find the position of "data": and parse from there
+                        let bytes = &full[..];
+                        let data_prefix = b"\"data\":";
+                        if let Some(pos) = bytes.windows(data_prefix.len()).position(|w| w == data_prefix) {
+                            let data_start = pos + data_prefix.len();
+                            serde_json::from_slice::<CachedProductItem>(&bytes[data_start..]).ok()
+                        } else {
+                            None
+                        }
+                    })
                     .map(|cached| ProductResponse::from(&cached))
                     .collect();
                 if list.is_empty() {
                     break;
                 }
                 let resp = ProductListResponse { list, total };
-                if let Ok(bytes) = serde_json::to_vec(&resp) {
-                    self.local.set_list_bytes(page, page_size, bytes);
+                if let Ok(list_bytes) = serde_json::to_vec(&resp) {
+                    let full = bytes::Bytes::from(build_full_response(&list_bytes));
+                    self.local.set_list_full(page, page_size, full);
                 }
                 page += 1;
                 if offset as usize + page_size as usize >= ids.len() {

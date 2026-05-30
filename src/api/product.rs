@@ -77,10 +77,9 @@ pub async fn get_by_id_cached(
     let id = path.into_inner();
 
     match service::product::get_product_cached(pool.get_ref(), cache.get_ref(), id).await {
-        Ok(CachedItemResult::Serialized(data_bytes)) => match trace_id {
-            Some(tid) => response::success_from_bytes_with_trace(data_bytes, tid),
-            None => response::success_from_bytes(data_bytes),
-        },
+        Ok(CachedItemResult::FullResponse(body)) => {
+            HttpResponse::Ok().content_type("application/json").body(body)
+        }
         Ok(CachedItemResult::Fresh(product)) => match trace_id {
             Some(tid) => response::success_with_trace(product, tid),
             None => response::success(product),
@@ -214,10 +213,9 @@ pub async fn list_cached(
     )
     .await
     {
-        Ok(CachedListResult::Serialized(data_bytes)) => match trace_id {
-            Some(tid) => response::success_from_bytes_with_trace(data_bytes, tid),
-            None => response::success_from_bytes(data_bytes),
-        },
+        Ok(CachedListResult::FullResponse(body)) => {
+            HttpResponse::Ok().content_type("application/json").body(body)
+        }
         Ok(CachedListResult::Fresh(products)) => match trace_id {
             Some(tid) => response::success_with_trace(products, tid),
             None => response::success(products),
