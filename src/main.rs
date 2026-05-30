@@ -4,8 +4,12 @@ use serde::Serialize;
 
 mod api;
 mod db;
+mod dto;
 mod error;
 mod middleware;
+mod models;
+mod repository;
+mod service;
 
 use api::response;
 use middleware::error_handler::{set_global_panic_hook, ErrorHandler};
@@ -86,6 +90,14 @@ async fn main() -> std::io::Result<()> {
             .service(unauthorized)
             .service(trace_demo)
             .route("/hey", web::get().to(manual_hello))
+            .service(
+                web::scope("/api/v1/products")
+                    .route("", web::post().to(api::product::create))
+                    .route("", web::get().to(api::product::list))
+                    .route("/{id}", web::get().to(api::product::get_by_id))
+                    .route("/{id}", web::put().to(api::product::update))
+                    .route("/{id}", web::delete().to(api::product::delete)),
+            )
             .default_service(web::to(not_found))
     })
     .bind(("127.0.0.1", 8080))?

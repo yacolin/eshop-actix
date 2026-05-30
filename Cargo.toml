@@ -7,7 +7,7 @@ edition = "2024"
 actix-web = "4"
 env_logger = "0.11"
 log = "0.4"
-sqlx = { version = "0.7", features = ["runtime-async-std-native-tls", "mysql"] }
+sqlx = { version = "0.7", features = ["runtime-async-std-native-tls", "mysql", "chrono"] }
 tokio = { version = "1", features = ["rt", "macros"] }
 dotenvy = "0.15"   # 可选，用于加载 .env 文件
 serde = { version = "1", features = ["derive"] }
