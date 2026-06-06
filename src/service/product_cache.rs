@@ -11,8 +11,8 @@ use crate::dto::product::{CachedProductItem, ProductListResponse, ProductRespons
 use crate::error::{BizError, ERR_INTERNAL_SERVER, ERR_PRODUCT_NOT_FOUND};
 use crate::repository;
 
-// ====== Helper: wrap data bytes into full ApiResponse JSON ======
-
+// ====== 辅助函数：将数据字节包装成完整的 ApiResponse JSON ======
+// 将传入的 data_bytes 放入 {"code":0,"message":"success","data":<data_bytes>} 中
 fn build_full_response(data_bytes: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(data_bytes.len() + 64);
     buf.extend_from_slice(b"{\"code\":0,\"message\":\"success\",\"data\":");
@@ -21,7 +21,9 @@ fn build_full_response(data_bytes: &[u8]) -> Vec<u8> {
     buf
 }
 
-// ====== Cached Response Types (pre-serialized bytes) ======
+// ====== 缓存响应类型（预序列化字节 vs 新鲜数据） ======
+// FullResponse: 直接从缓存返回的完整 JSON 字节，无需序列化
+// Fresh: 从数据库查询到的新数据，由调用方处理
 
 pub enum CachedItemResult {
     FullResponse(bytes::Bytes),
@@ -33,7 +35,14 @@ pub enum CachedListResult {
     Fresh(ProductListResponse),
 }
 
-// ====== Constants ======
+// ====== 常量配置 ======
+// ZSET: Redis 有序集合，用于存储产品 ID 列表，支持分页排序
+// INFO_PREFIX: 产品详情缓存键前缀
+// LOCAL_CACHE_TTL: 本地单条缓存有效期 60 秒
+// LOCAL_LIST_CACHE_TTL: 本地列表缓存有效期 30 秒
+// HOT_KEY_THRESHOLD: 热点 key 判定阈值（10 秒内访问超过 1000 次）
+// EMPTY_PLACEHOLDER: 空值占位符，防止缓存穿透
+// BLOOM_SIZE/HASHES: 布隆过滤器参数（100 万位，7 个哈希函数）
 
 const PRODUCT_CACHE_ZSET: &str = "product:zset";
 const PRODUCT_INFO_PREFIX: &str = "product:info:";
@@ -46,7 +55,10 @@ const EMPTY_CACHE_TTL: u64 = 30;
 const BLOOM_SIZE: usize = 1_000_000;
 const BLOOM_HASHES: u32 = 7;
 
-// ====== Lua Script ======
+// ====== Redis Lua 脚本：原子化分页查询 ======
+// 功能：一次往返完成 ZSET 分页 + MGET 批量获取详情
+// 参数：KEYS[1]=zset键, ARGV[1]=起始偏移, ARGV[2]=结束偏移, ARGV[3]=排序方向(desc/asc), ARGV[4]=详情键前缀
+// 返回：{total_count, [value1, value2, ...]}
 
 static ZRANGE_MGET_SCRIPT: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
@@ -69,7 +81,10 @@ return {total, values}
     )
 });
 
-// ====== Bloom Filter ======
+// ====== 布隆过滤器（Bloom Filter） ======
+// 用于快速判断一个产品 ID 是否可能存在，减少对本地缓存的无效查询
+// 使用无锁 AtomicU64 位数组，支持高并发写入
+// 特点：不存在 → 一定不存在；存在 → 可能存在（有误判率）
 
 struct BloomFilter {
     bits: Vec<AtomicU64>,
@@ -99,6 +114,7 @@ impl BloomFilter {
         (hasher.finish() as usize) % self.size
     }
 
+    // 将 id 映射到位数组中的 k 个位置，将对应位设为 1
     fn add(&self, id: i64) {
         for i in 0..self.num_hashes {
             let idx = self.hash(id, i);
@@ -108,6 +124,7 @@ impl BloomFilter {
         }
     }
 
+    // 检查 id 是否可能存在（返回 false 则一定不存在）
     fn may_exist(&self, id: i64) -> bool {
         for i in 0..self.num_hashes {
             let idx = self.hash(id, i);
@@ -120,6 +137,7 @@ impl BloomFilter {
         true
     }
 
+    // 清空所有位
     fn clear(&self) {
         for word in &self.bits {
             word.store(0, Ordering::Relaxed);
@@ -133,7 +151,9 @@ impl BloomFilter {
     }
 }
 
-// ====== Hot Key Counter ======
+// ====== 热点 Key 计数器 ======
+// 用于识别热点数据，为后续可能的本地缓存提升做决策依据
+// DashMap 实现无锁并发，每个 key 记录窗口期内的访问次数
 
 struct HotKeyCounter {
     counters: DashMap<i64, (u64, Instant)>,
@@ -146,6 +166,7 @@ impl HotKeyCounter {
         }
     }
 
+    // 增加计数，返回是否已达到热点阈值
     fn increment(&self, id: i64) -> bool {
         let now = Instant::now();
         let mut entry = self.counters.entry(id).or_insert((0, now));
@@ -162,7 +183,10 @@ impl HotKeyCounter {
     }
 }
 
-// ====== Local Cache ======
+// ====== 本地缓存（一级缓存） ======
+// 使用 DashMap 实现无锁并发，存储预序列化后的完整响应字节
+// 单条缓存：key=产品ID, value=(存入时间, 完整JSON字节)
+// 列表缓存：key=(页码, 每页数量), value=(存入时间, 完整JSON字节)
 
 struct LocalCache {
     single_full: DashMap<i64, (Instant, bytes::Bytes)>,
@@ -222,7 +246,9 @@ impl LocalCache {
     }
 }
 
-// ====== Inner Cache (active when Redis is available) ======
+// ====== 内部缓存引擎（Redis 可用时激活） ======
+// 实现三级缓存策略：本地缓存(L1) → Redis(L2) → 数据库(L3)
+// 包含连接池轮询、布隆过滤器、热点计数等优化机制
 
 struct InnerCache {
     redis_conns: Vec<tokio::sync::Mutex<ConnectionManager>>,
@@ -233,6 +259,7 @@ struct InnerCache {
 }
 
 impl InnerCache {
+    // 轮询获取 Redis 连接，实现连接的负载均衡
     fn get_conn(&self) -> &tokio::sync::Mutex<ConnectionManager> {
         let idx = self
             .next_conn
@@ -241,6 +268,10 @@ impl InnerCache {
         &self.redis_conns[idx]
     }
 
+    // 三级缓存查询：本地缓存(L1) → Redis(L2) → 数据库(L3)
+    // 1. 先查布隆过滤器 + 本地缓存（最快，毫秒级）
+    // 2. 本地未命中则查 Redis（网络往返，微秒级）
+    // 3. Redis 未命中则查数据库，并回写 Redis + 本地缓存
     async fn get_by_id(&self, pool: &MySqlPool, id: i64) -> Result<CachedItemResult, BizError> {
         let redis_key = format!("{}{}", PRODUCT_INFO_PREFIX, id);
 
@@ -311,6 +342,9 @@ impl InnerCache {
         }
     }
 
+    // 分页列表查询（三级缓存）
+    // 有关键词时直接查数据库（不支持关键词的缓存）
+    // 无关键词时：本地缓存列表 → Redis ZSET+MGET → 数据库
     async fn list(
         &self,
         pool: &MySqlPool,
@@ -318,6 +352,7 @@ impl InnerCache {
         page: u32,
         page_size: u32,
     ) -> Result<CachedListResult, BizError> {
+        // 有关键词搜索时跳过缓存，直接查数据库
         if keyword.is_some() {
             let resp = Self::list_from_db(pool, keyword, page, page_size).await?;
             return Ok(CachedListResult::Fresh(resp));
@@ -369,6 +404,7 @@ impl InnerCache {
             }
         }
 
+        // Redis 缓存未命中或失败时，回退到数据库查询
         let resp = Self::list_from_db(pool, None, page, page_size).await?;
         Ok(CachedListResult::Fresh(resp))
     }
@@ -433,6 +469,8 @@ impl InnerCache {
         }
     }
 
+    // 缓存预热：从数据库加载所有产品，填充 Redis 和本地缓存
+    // 步骤：清空旧缓存 → 批量写入 Redis SET+ZADD → 重建布隆过滤器 → 预热本地列表缓存
     async fn warmup(&self, pool: &MySqlPool) -> Result<i32, BizError> {
         let products = repository::product::find_list(pool, None, 0, u32::MAX)
             .await
@@ -526,6 +564,7 @@ impl InnerCache {
         Ok(ids.len() as i32)
     }
 
+    // 删除缓存：同时清理本地缓存和 Redis（用于数据更新后失效缓存）
     async fn evict_product(&self, id: i64) {
         self.local.remove_single(id);
         self.local.clear_lists();
@@ -546,13 +585,18 @@ impl InnerCache {
     }
 }
 
-// ====== Public ProductCache ======
+// ====== 公开的 ProductCache 结构体 ======
+// 对外暴露缓存接口，内部封装 InnerCache 的可选逻辑
+// 当 Redis 不可用时（inner=None），自动降级为直接查询数据库
 
 pub struct ProductCache {
     inner: Option<InnerCache>,
 }
 
 impl ProductCache {
+    // 创建缓存实例，传入可选的 Redis 连接列表
+    // Some(conns)：启用三级缓存（本地+Redis+DB）
+    // None：降级为直连数据库
     pub fn new(conns: Option<Vec<ConnectionManager>>) -> Self {
         ProductCache {
             inner: conns.map(|managers| InnerCache {
@@ -565,6 +609,7 @@ impl ProductCache {
         }
     }
 
+    // 对外查询接口：有缓存走三级缓存，无缓存直查数据库
     pub async fn get_by_id(&self, pool: &MySqlPool, id: i64) -> Result<CachedItemResult, BizError> {
         match &self.inner {
             Some(cache) => cache.get_by_id(pool, id).await,
@@ -583,6 +628,7 @@ impl ProductCache {
         }
     }
 
+    // 对外列表查询接口
     pub async fn list(
         &self,
         pool: &MySqlPool,
@@ -614,6 +660,7 @@ impl ProductCache {
         }
     }
 
+    // 缓存预热接口：将数据库数据加载到 Redis 和本地缓存
     pub async fn warmup(&self, pool: &MySqlPool) -> Result<i32, BizError> {
         match &self.inner {
             Some(cache) => cache.warmup(pool).await,
@@ -624,6 +671,7 @@ impl ProductCache {
         }
     }
 
+    // 删除单个产品缓存（用于数据更新后失效缓存）
     #[allow(dead_code)]
     pub async fn evict_product(&self, id: i64) {
         if let Some(cache) = &self.inner {
@@ -631,6 +679,8 @@ impl ProductCache {
         }
     }
 
+    // 延迟双删策略：解决缓存与数据库的一致性问题
+    // 先立即删除缓存，500ms 后再次删除，确保并发读写时不会读到旧数据
     pub async fn delayed_double_delete(&self, id: i64) {
         if let Some(cache) = &self.inner {
             cache.evict_product(id).await;
@@ -654,6 +704,7 @@ impl ProductCache {
         }
     }
 
+    // 向布隆过滤器添加 ID（新产品创建时调用）
     pub fn bloom_add(&self, id: i64) {
         if let Some(cache) = &self.inner {
             cache.bloom_add(id);
