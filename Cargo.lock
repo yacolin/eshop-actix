@@ -959,6 +959,7 @@ dependencies = [
  "redis",
  "serde",
  "serde_json",
+ "socket2 0.5.10",
  "sqlx",
  "tokio",
  "uuid",

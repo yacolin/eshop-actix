@@ -13,11 +13,23 @@ mod repository;
 mod service;
 
 use api::response;
-use middleware::error_handler::{ErrorHandler, set_global_panic_hook};
-use middleware::logger::ConditionalLogger;
-use middleware::trace::{ConditionalTrace, get_trace_id};
+use middleware::error_handler::set_global_panic_hook;
+use middleware::trace::get_trace_id;
 use service::inventory_cache::InventoryCache;
 use service::product_cache::ProductCache;
+
+fn bind_reuse_port(addr: &str, backlog: u32) -> std::io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Socket, Type};
+
+    let sa: std::net::SocketAddr = addr.parse().expect("invalid addr");
+    let socket = Socket::new(Domain::for_address(sa), Type::STREAM, None)?;
+    socket.set_nonblocking(true)?;
+    socket.set_reuse_address(true)?;
+    socket.set_reuse_port(true)?;
+    socket.bind(&sa.into())?;
+    socket.listen(backlog as _)?;
+    Ok(socket.into())
+}
 
 #[get("/")]
 async fn hello() -> impl Responder {
@@ -116,9 +128,6 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(pool.clone()))
             .app_data(product_cache.clone())
             .app_data(inventory_cache.clone())
-            .wrap(ConditionalTrace)
-            .wrap(ConditionalLogger)
-            .wrap(ErrorHandler)
             .service(hello)
             .service(echo)
             .service(db_status)
@@ -155,7 +164,8 @@ async fn main() -> std::io::Result<()> {
     .workers(num_workers)
     .backlog(4096)
     .max_connections(25000)
-    .bind(("127.0.0.1", 8080))?
+    .listen(bind_reuse_port("127.0.0.1:8080", 4096)?)?
+    .listen(bind_reuse_port("127.0.0.1:8080", 4096)?)?
     .run()
     .await
 }

@@ -18,3 +18,4 @@ redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 dashmap = "6"
 futures = "0.3"
 bytes = "1"
+socket2 = { version = "0.5", features = ["all"] }
